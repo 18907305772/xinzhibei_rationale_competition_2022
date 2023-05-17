@@ -1,0 +1,2 @@
+model,dataset,train valid split,max len,per gpu batch size,gradient accumulate steps,learning rate,epoch,tricks,eval acc,test acc
+posttrain_models_chinese_roberta_wwm_ext_large_50ep_all,LCQMC_transfer_aug,one-fold,64,25,5,5e-05,5.0,tricks_LINEAR-scheduler_fgm_cls_th_0.97,0.9102476835250854, 
