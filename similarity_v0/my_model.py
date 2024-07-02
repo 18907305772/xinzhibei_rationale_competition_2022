@@ -181,6 +181,8 @@ class myBertForSequenceClassification(BertPreTrainedModel):
                     self.config.problem_type = "regression"
                 elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
                     self.config.problem_type = "single_label_classification"
+                elif labels.dtype == torch.float:
+                    self.config.problem_type = "soft_label_classification"
                 else:
                     self.config.problem_type = "multi_label_classification"
 
@@ -193,7 +195,9 @@ class myBertForSequenceClassification(BertPreTrainedModel):
             elif self.config.problem_type == "single_label_classification":
                 loss_fct = CrossEntropyLoss()
                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-            elif self.config.problem_type == "multi_label_classification":
+            elif self.config.problem_type in ["multi_label_classification", "soft_label_classification"]:
+                if self.config.problem_type == "soft_label_classification":
+                    labels = torch.stack([1 - labels, labels], dim=1)
                 loss_fct = BCEWithLogitsLoss()
                 loss = loss_fct(logits, labels)
 
