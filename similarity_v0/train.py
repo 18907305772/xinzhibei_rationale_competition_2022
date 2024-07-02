@@ -15,18 +15,22 @@
 # limitations under the License.
 """ Finetuning the library models for sequence classification on GLUE."""
 # You can also adapt this script on your own text classification task. Pointers for this are left as comments.
-import csv
+
 import logging
 import os
 import random
 import sys
+import warnings
+import unicodedata
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
 import datasets
-import numpy as np
-from datasets import load_dataset, load_metric
 import torch
+import evaluate
+import numpy as np
+from datasets import load_dataset
 
 import transformers
 from transformers import (
@@ -41,15 +45,17 @@ from transformers import (
     TrainingArguments,
     default_data_collator,
     set_seed,
-    BertTokenizer,
 )
 from transformers.trainer_utils import get_last_checkpoint
-from transformers.utils import check_min_version
+from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
-from transformers.trainer_utils import is_main_process
-from transformers.file_utils import cached_property, torch_required, is_torch_available, is_torch_tpu_available
+from transformers.file_utils import cached_property, is_torch_available, is_torch_tpu_available
 from my_trainer import MyTrainer
 from my_model import myBertForSequenceClassification
+
+# Will error if the minimal version of Transformers is not installed. Remove at your own risks.
+
+require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/text-classification/requirements.txt")
 
 task_to_keys = {
     "cola": ("sentence", None),
@@ -70,6 +76,7 @@ logger = logging.getLogger(__name__)
 class DataTrainingArguments:
     """
     Arguments pertaining to what data we are going to input our model for training and eval.
+
     Using `HfArgumentParser` we can turn this class
     into argparse arguments to be able to specify them on
     the command line.
@@ -155,7 +162,7 @@ class DataTrainingArguments:
             assert train_extension in ["csv", "json"], "`train_file` should be a csv or a json file."
             validation_extension = self.validation_file.split(".")[-1]
             assert (
-                    validation_extension == train_extension
+                validation_extension == train_extension
             ), "`validation_file` should have the same extension (csv or json) as `train_file`."
 
 
@@ -186,12 +193,28 @@ class ModelArguments:
         default="main",
         metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
     )
+    token: str = field(
+        default=None,
+        metadata={
+            "help": (
+                "The token to use as HTTP bearer authorization for remote files. If not specified, will use the token "
+                "generated when running `huggingface-cli login` (stored in `~/.huggingface`)."
+            )
+        },
+    )
     use_auth_token: bool = field(
+        default=None,
+        metadata={
+            "help": "The `use_auth_token` argument is deprecated and will be removed in v4.34. Please use `token` instead."
+        },
+    )
+    trust_remote_code: bool = field(
         default=False,
         metadata={
             "help": (
-                "Will use the token generated when running `transformers-cli login` (necessary to use this script "
-                "with private models)."
+                "Whether or not to allow for custom models defined on the Hub in their own modeling files. This option "
+                "should only be set to `True` for repositories you trust and in which you have read the code, as it will "
+                "execute code present on the Hub on your local machine."
             )
         },
     )
@@ -199,7 +222,6 @@ class ModelArguments:
         default=False,
         metadata={"help": "Will enable to load a pretrained model whose head dimensions are different."},
     )
-
 
 @dataclass
 class OurTrainingArguments(TrainingArguments):
@@ -293,52 +315,10 @@ class OurTrainingArguments(TrainingArguments):
         default=0.5,
         metadata={"help": "classification threshold."}
     )
-    @cached_property
-    @torch_required
-    def _setup_devices(self) -> "torch.device":
-        logger.info("PyTorch: setting up devices")
-        if self.no_cuda:
-            device = torch.device("cpu")
-            self._n_gpu = 0
-        elif is_torch_tpu_available():
-            # device = xm.xla_device()
-            self._n_gpu = 0
-        elif self.local_rank == -1:
-            # if n_gpu is > 1 we'll use nn.DataParallel.
-            # If you only want to use a specific subset of GPUs use `CUDA_VISIBLE_DEVICES=0`
-            # Explicitly set CUDA to the first (index 0) CUDA device, otherwise `set_device` will
-            # trigger an error that a device index is missing. Index 0 takes into account the
-            # GPUs available in the environment, so `CUDA_VISIBLE_DEVICES=1,2` with `cuda:0`
-            # will use the first GPU in that env, i.e. GPU#1
-            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-            # Sometimes the line in the postinit has not been run before we end up here, so just checking we're not at
-            # the default value.
-            self._n_gpu = torch.cuda.device_count()
-        else:
-            # Here, we'll use torch.distributed.
-            # Initializes the distributed backend which will take care of synchronizing nodes/GPUs
-            #
-            # deepspeed performs its own DDP internally, and requires the program to be started with:
-            # deepspeed  ./program.py
-            # rather than:
-            # python -m torch.distributed.launch --nproc_per_node=2 ./program.py
-            if self.deepspeed:
-                from transformers.integrations import is_deepspeed_available
-
-                if not is_deepspeed_available():
-                    raise ImportError("--deepspeed requires deepspeed: `pip install deepspeed`.")
-                import deepspeed
-
-                deepspeed.init_distributed()
-            else:
-                torch.distributed.init_process_group(backend="nccl")
-            device = torch.device("cuda", self.local_rank)
-            self._n_gpu = 1
-
-        if device.type == "cuda":
-            torch.cuda.set_device(device)
-
-        return device
+    do_soft_label: bool = field(
+        default=False,
+        metadata={"help": "软标签"}
+    )
 
 
 def main():
@@ -387,41 +367,64 @@ def main():
     if training_args.classification_threshold != 0.5:
         tricks += "_th_{}".format(training_args.classification_threshold)
 
-    training_args.output_dir += "{}_{}_{}_bs{}_accumulate{}_lr{}_epoch{}{}/".format(
-        training_args.train_dataset_name, training_args.train_valid_split,
+    training_args.output_dir += "{}_{}_bs{}_accumulate{}_lr{}_epoch{}/".format(
+        tricks,
         model_args.model_name_or_path.replace("/", "_"), training_args.per_device_train_batch_size,
-        training_args.gradient_accumulation_steps, training_args.learning_rate, training_args.num_train_epochs, tricks)
+        training_args.gradient_accumulation_steps, training_args.learning_rate, training_args.num_train_epochs, )
 
-    if (
-            os.path.exists(training_args.output_dir)
-            and os.listdir(training_args.output_dir)
-            and training_args.do_train
-            and not training_args.overwrite_output_dir
-    ):
-        raise ValueError(
-            f"Output directory ({training_args.output_dir}) already exists and is not empty."
-            "Use --overwrite_output_dir to overcome."
+
+    if model_args.use_auth_token is not None:
+        warnings.warn(
+            "The `use_auth_token` argument is deprecated and will be removed in v4.34. Please use `token` instead.",
+            FutureWarning,
         )
+        if model_args.token is not None:
+            raise ValueError("`token` and `use_auth_token` are both specified. Please set only the argument `token`.")
+        model_args.token = model_args.use_auth_token
+
+    # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
+    # information sent is the one passed as arguments along with your Python/PyTorch versions.
+    send_example_telemetry("run_glue", model_args, data_args)
 
     # Setup logging
     logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO if is_main_process(training_args.local_rank) else logging.WARN,
+        handlers=[logging.StreamHandler(sys.stdout)],
     )
+
+    if training_args.should_log:
+        # The default of training_args.log_level is passive, so we set log level at info here to have that default.
+        transformers.utils.logging.set_verbosity_info()
+
+    log_level = training_args.get_process_log_level()
+    logger.setLevel(log_level)
+    datasets.utils.logging.set_verbosity(log_level)
+    transformers.utils.logging.set_verbosity(log_level)
+    transformers.utils.logging.enable_default_handler()
+    transformers.utils.logging.enable_explicit_format()
 
     # Log on each process the small summary:
     logger.warning(
-        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
-        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}, "
+        + f"distributed training: {training_args.parallel_mode.value == 'distributed'}, 16-bits training: {training_args.fp16}"
     )
-    # Set the verbosity to info of the Transformers logger (on main process only):
-    if is_main_process(training_args.local_rank):
-        transformers.utils.logging.set_verbosity_info()
-        transformers.utils.logging.enable_default_handler()
-        transformers.utils.logging.enable_explicit_format()
-
     logger.info(f"Training/evaluation parameters {training_args}")
+
+    # Detecting last checkpoint.
+    last_checkpoint = None
+    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
+        last_checkpoint = get_last_checkpoint(training_args.output_dir)
+        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
+            raise ValueError(
+                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
+                "Use --overwrite_output_dir to overcome."
+            )
+        elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
+            logger.info(
+                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
+                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
+            )
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
@@ -441,10 +444,9 @@ def main():
     if data_args.task_name is not None:
         # Downloading and loading a dataset from the hub.
         raw_datasets = load_dataset(
-            "glue",
+            "nyu-mll/glue",
             data_args.task_name,
             cache_dir=model_args.cache_dir,
-            use_auth_token=True if model_args.use_auth_token else None,
         )
     elif data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
@@ -452,7 +454,6 @@ def main():
             data_args.dataset_name,
             data_args.dataset_config_name,
             cache_dir=model_args.cache_dir,
-            use_auth_token=True if model_args.use_auth_token else None,
         )
     else:
         # Loading a dataset from your local files.
@@ -466,7 +467,7 @@ def main():
                 train_extension = data_args.train_file.split(".")[-1]
                 test_extension = data_args.test_file.split(".")[-1]
                 assert (
-                        test_extension == train_extension
+                    test_extension == train_extension
                 ), "`test_file` should have the same extension (csv or json) as `train_file`."
                 data_files["test"] = data_args.test_file
             else:
@@ -481,7 +482,6 @@ def main():
                 "csv",
                 data_files=data_files,
                 cache_dir=model_args.cache_dir,
-                use_auth_token=True if model_args.use_auth_token else None,
             )
         else:
             # Loading a dataset from local json files
@@ -489,10 +489,9 @@ def main():
                 "json",
                 data_files=data_files,
                 cache_dir=model_args.cache_dir,
-                use_auth_token=True if model_args.use_auth_token else None,
             )
     # See more about loading any type of standard or custom dataset at
-    # https://huggingface.co/docs/datasets/loading_datasets.html.
+    # https://huggingface.co/docs/datasets/loading_datasets.
 
     # Labels
     if data_args.task_name is not None:
@@ -504,15 +503,18 @@ def main():
             num_labels = 1
     else:
         # Trying to have good defaults here, don't hesitate to tweak to your needs.
-        is_regression = raw_datasets["train"].features["label"].dtype in ["float32", "float64"]
+        is_regression = raw_datasets["train"].features["label"].dtype in ["float32", "float64"] and not training_args.do_soft_label
         if is_regression:
             num_labels = 1
         else:
             # A useful fast method:
-            # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.unique
-            label_list = raw_datasets["train"].unique("label")
-            label_list.sort()  # Let's sort it for determinism
-            num_labels = len(label_list)
+            # https://huggingface.co/docs/datasets/package_reference/main_classes#datasets.Dataset.unique
+            if training_args.do_soft_label:
+                num_labels = 2
+            else:            
+                label_list = raw_datasets["train"].unique("label")
+                label_list.sort()  # Let's sort it for determinism
+                num_labels = len(label_list)
 
     # Load pretrained model and tokenizer
     #
@@ -524,48 +526,24 @@ def main():
         finetuning_task=data_args.task_name,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
+        trust_remote_code=model_args.trust_remote_code,
     )
-    if config.model_type == "bert" or config.model_type == "roberta":
-        tokenizer = BertTokenizer.from_pretrained(
-            model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
-            cache_dir=model_args.cache_dir,
-            use_fast=model_args.use_fast_tokenizer,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
-        model = myBertForSequenceClassification.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
-            config=config,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-            ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
-            pool_type=training_args.pool_type,
-            classifier_dropout=training_args.classifier_dropout,
-            multi_sample_dropout_num=training_args.multi_sample_dropout_num,
-            multi_sample_avg=training_args.multi_sample_avg,
-            mix_up=training_args.mix_up,
-            mix_up_layer=training_args.mix_up_layer
-        )
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
-            cache_dir=model_args.cache_dir,
-            use_fast=model_args.use_fast_tokenizer,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
-        model = AutoModelForSequenceClassification.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
-            config=config,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-            ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
-        )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+        cache_dir=model_args.cache_dir,
+        use_fast=model_args.use_fast_tokenizer,
+        revision=model_args.model_revision,
+        trust_remote_code=model_args.trust_remote_code,
+    )
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_args.model_name_or_path,
+        from_tf=bool(".ckpt" in model_args.model_name_or_path),
+        config=config,
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        trust_remote_code=model_args.trust_remote_code,
+        ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
+    )
 
     # Preprocessing the raw_datasets
     if data_args.task_name is not None:
@@ -573,13 +551,13 @@ def main():
     else:
         # Again, we try to have some nice defaults but don't hesitate to tweak to your use case.
         non_label_column_names = [name for name in raw_datasets["train"].column_names if name != "label"]
-        if len(non_label_column_names) == 3:
-            sentence1_key, sentence2_key, sentence3_key = non_label_column_names[:3]
-        elif len(non_label_column_names) == 2:
-            sentence1_key, sentence2_key = non_label_column_names[:2]
-            sentence3_key = None
+        if "sentence1" in non_label_column_names and "sentence2" in non_label_column_names:
+            sentence1_key, sentence2_key = "sentence1", "sentence2"
         else:
-            sentence1_key, sentence2_key, sentence3_key = non_label_column_names[0], None, None
+            if len(non_label_column_names) >= 2:
+                sentence1_key, sentence2_key = non_label_column_names[:2]
+            else:
+                sentence1_key, sentence2_key = non_label_column_names[0], None
 
     # Padding strategy
     if data_args.pad_to_max_length:
@@ -591,24 +569,26 @@ def main():
     # Some models have set the order of the labels to use, so let's make sure we do use it.
     label_to_id = None
     if (
-            model.config.label2id != PretrainedConfig(num_labels=num_labels).label2id
-            and data_args.task_name is not None
-            and not is_regression
+        model.config.label2id != PretrainedConfig(num_labels=num_labels).label2id
+        and data_args.task_name is not None
+        and not is_regression
     ):
         # Some have all caps in their config, some don't.
         label_name_to_id = {k.lower(): v for k, v in model.config.label2id.items()}
-        if list(sorted(label_name_to_id.keys())) == list(sorted(label_list)):
+        if sorted(label_name_to_id.keys()) == sorted(label_list):
             label_to_id = {i: int(label_name_to_id[label_list[i]]) for i in range(num_labels)}
         else:
             logger.warning(
                 "Your model seems to have been trained with labels, but they don't match the dataset: ",
-                f"model labels: {list(sorted(label_name_to_id.keys()))}, dataset labels: {list(sorted(label_list))}."
+                f"model labels: {sorted(label_name_to_id.keys())}, dataset labels: {sorted(label_list)}."
                 "\nIgnoring the model labels as a result.",
             )
     elif data_args.task_name is None and not is_regression:
         label_to_id = {v: i for i, v in enumerate(label_list)}
 
-    if label_to_id is not None:
+    if training_args.do_soft_label:
+        pass
+    elif label_to_id is not None:
         model.config.label2id = label_to_id
         model.config.id2label = {id: label for label, id in config.label2id.items()}
     elif data_args.task_name is not None and not is_regression:
@@ -617,34 +597,61 @@ def main():
 
     if data_args.max_seq_length > tokenizer.model_max_length:
         logger.warning(
-            f"The max_seq_length passed ({data_args.max_seq_length}) is larger than the maximum length for the"
+            f"The max_seq_length passed ({data_args.max_seq_length}) is larger than the maximum length for the "
             f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
         )
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
+    def remove_emojis(text):
+        # 使用正则表达式匹配表情
+        pattern = r'\[em\]e\d+\[/em\]'
+        # 使用re.sub()函数替换匹配到的表情为空字符
+        result = re.sub(pattern, '', text)
+        return result
+
+    def remove_mark(c):  # 去除字符中的符号
+        cat = unicodedata.category(c)
+        remove_set = {
+            "Mn", "Me", "Mc",
+        }
+        if cat in remove_set:
+            return False
+        return True
+
+    def remove_punctuation_all(sentence):
+        # 使用正则表达式匹配开头和末尾的所有标点符号
+        pattern = r'^[^\w\s]+|[^\w\s]+$'
+        # 使用re.sub()函数替换匹配到的标点符号为空字符
+        result = re.sub(pattern, '', sentence)
+        return result
+
+    def unicode_normalize(sentence):
+        sentence = unicodedata.normalize("NFKD", sentence)
+        sentence = "".join(filter(remove_mark, sentence))
+        sentence = unicodedata.normalize("NFKC", sentence)
+        sentence = sentence.lower()
+        return sentence
+    
     def preprocess_function(examples):
         # Tokenize the texts
-        if sentence3_key is None and sentence2_key is None:
-            args = (examples[sentence1_key],)
-        elif sentence3_key is None:
-            args = (examples[sentence1_key], examples[sentence2_key])
-        else:
-            exps1 = [examples[sentence1_key][i] + tokenizer.sep_token + examples[sentence2_key][i] for i in range(len(examples[sentence1_key]))]
-            args = (exps1, examples[sentence3_key])
+        for key in [sentence1_key, sentence2_key]:
+            if key is None:
+                continue
+            example_key = []
+            for ex in examples[key]:
+                text = unicode_normalize(ex)
+                text = remove_emojis(text)
+                example_key.append(remove_punctuation_all(text))
+            examples[key] = example_key        
+        args = (
+            (examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
+        )
         result = tokenizer(*args, padding=padding, max_length=max_seq_length, truncation=True)
-        if sentence3_key is not None:
-            sep = tokenizer.convert_tokens_to_ids('[SEP]')
-            sep_idx = [result.input_ids[i].index(sep) for i in range(np.array(result.input_ids).shape[0])]  # 找到第一个 [SEP]
-            for i in range(len(sep_idx)):  # 反转之后的所有值
-                reverse_token = result.token_type_ids[i][sep_idx[i] + 1:]
-                tmp = np.array(reverse_token) == 0
-                tmp = tmp.tolist()
-                tmp = [int(tmp[i]) for i in range(len(tmp))]
-                result.token_type_ids[i] = result.token_type_ids[i][:sep_idx[i] + 1] + tmp
 
         # Map labels to IDs (not necessary for GLUE tasks)
         if label_to_id is not None and "label" in examples:
-            result["label"] = [(label_to_id[l] if l in label_to_id else -1) for l in examples["label"]]
+            result["label"] = examples["label"]
+            # result["label"] = [(label_to_id[l] if l != -1 else -1) for l in examples["label"]]
         return result
 
     with training_args.main_process_first(desc="dataset map pre-processing"):
@@ -685,37 +692,34 @@ def main():
 
     # Get the metric function
     if data_args.task_name is not None:
-        metric = load_metric("glue", data_args.task_name)
+        metric = evaluate.load("glue", data_args.task_name, cache_dir=model_args.cache_dir)
+    elif is_regression:
+        metric = evaluate.load("mse", cache_dir=model_args.cache_dir)
     else:
-        metric = load_metric("accuracy")
+        # 我测试的场景基本上是长尾分布，因此将acc改为f1
+        metric = evaluate.load("f1", cache_dir=model_args.cache_dir)
 
     # You can define your custom compute_metrics function. It takes an `EvalPrediction` object (a namedtuple with a
     # predictions and label_ids field) and has to return a dictionary string to float.
     def compute_metrics(p: EvalPrediction):
         preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
+        preds = torch.softmax(torch.tensor(preds), dim=-1)        
         if training_args.classification_threshold != 0.5:
             margin = training_args.classification_threshold - 0.5
             preds[:, 0] += margin
             preds[:, 1] -= margin
         preds = np.squeeze(preds) if is_regression else np.argmax(preds, axis=1)
-        if data_args.task_name is not None:
-            result = metric.compute(predictions=preds, references=p.label_ids)
-            if len(result) > 1:
-                result["combined_score"] = np.mean(list(result.values())).item()
-            return result
-        elif is_regression:
-            return {"mse": ((preds - p.label_ids) ** 2).mean().item()}
-        else:
-            return {"accuracy": (preds == p.label_ids).astype(np.float32).mean().item()}
+        result = metric.compute(predictions=preds, references=p.label_ids)
+        if len(result) > 1:
+            result["combined_score"] = np.mean(list(result.values())).item()
+        return result
 
     # Data collator will default to DataCollatorWithPadding when the tokenizer is passed to Trainer, so we change it if
     # we already did the padding.
-
     if data_args.pad_to_max_length:
-        if training_args.fp16:
-            data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
-        else:
-            data_collator = default_data_collator
+        data_collator = default_data_collator
+    elif training_args.fp16:
+        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
     else:
         data_collator = None
 
@@ -742,7 +746,8 @@ def main():
         checkpoint = None
         if training_args.resume_from_checkpoint is not None:
             checkpoint = training_args.resume_from_checkpoint
-            print(checkpoint)
+        elif last_checkpoint is not None:
+            checkpoint = last_checkpoint
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         metrics = train_result.metrics
         max_train_samples = (
@@ -754,7 +759,7 @@ def main():
 
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
-        trainer.save_state()
+        # trainer.save_state()
 
     # Evaluation
     if training_args.do_eval:
@@ -765,7 +770,11 @@ def main():
         eval_datasets = [eval_dataset]
         if data_args.task_name == "mnli":
             tasks.append("mnli-mm")
-            eval_datasets.append(raw_datasets["validation_mismatched"])
+            valid_mm_dataset = raw_datasets["validation_mismatched"]
+            if data_args.max_eval_samples is not None:
+                max_eval_samples = min(len(valid_mm_dataset), data_args.max_eval_samples)
+                valid_mm_dataset = valid_mm_dataset.select(range(max_eval_samples))
+            eval_datasets.append(valid_mm_dataset)
             combined = {}
 
         for eval_dataset, task in zip(eval_datasets, tasks):
@@ -783,23 +792,6 @@ def main():
 
             trainer.log_metrics("eval", metrics)
             trainer.save_metrics("eval", combined if task is not None and "mnli" in task else metrics)
-            # record validation result
-            if trainer.is_world_process_zero():
-                if not os.path.exists(training_args.result_record_csv):
-                    record_writer = csv.writer(open(training_args.result_record_csv, 'w'), delimiter=',')
-                    csv_head = ["model", "dataset", "train valid split", "max len",
-                                "per gpu batch size", "gradient accumulate steps", "learning rate", "epoch", "tricks",
-                                "eval acc", "test acc"]
-                    record_writer.writerow(csv_head)
-                else:
-                    record_writer = csv.writer(open(training_args.result_record_csv, 'a+'), delimiter=',')
-                tricks = "tricks" + tricks
-                valid_record = [model_args.model_name_or_path.replace("/", "_"), training_args.train_dataset_name,
-                                training_args.train_valid_split, data_args.max_seq_length,
-                                training_args.per_device_train_batch_size, training_args.gradient_accumulation_steps,
-                                training_args.learning_rate, training_args.num_train_epochs, tricks,
-                                metrics["eval_accuracy"], " "]
-                record_writer.writerow(valid_record)
 
     if training_args.do_predict:
         logger.info("*** Predict ***")
@@ -815,48 +807,16 @@ def main():
             # Removing the `label` columns because it contains -1 and Trainer won't like that.
             predict_dataset = predict_dataset.remove_columns("label")
             predictions = trainer.predict(predict_dataset, metric_key_prefix="predict").predictions
-            if training_args.classification_threshold != 0.5:
-                margin = training_args.classification_threshold - 0.5
-                predictions[:, 0] += margin
-                predictions[:, 1] -= margin
-            predictions = np.squeeze(predictions) if is_regression else np.argmax(predictions, axis=1)
-            output_predict_file = "submit/" + training_args.output_dir[7:-1] + ".csv"
+            if not is_regression:
+                predictions = torch.softmax(torch.tensor(predictions), dim=-1)
+            final_predictions = predictions[:, -1]
+            output_predict_file = os.path.join(training_args.output_dir, f"predict_results_{task}.txt")
             if trainer.is_world_process_zero():
-                writer = csv.writer(open(output_predict_file, 'w'), delimiter=',')
                 logger.info(f"***** Predict results {task} *****")
-                writer.writerow(['Label'])
-                for idx, item in enumerate(predictions):
-                    item = label_list[item]
-                    writer.writerow([item])
-
-    # if training_args.training_data_clean is True:
-    #     logger.info("*** Predict Training data ***")
-    #
-    #     predict_datasets = [train_dataset, eval_dataset]
-    #     datasets_name = ["train", "valid"]
-    #     datasets_file = [data_args.train_file, data_args.validation_file]
-    #     for idx, predict_dataset in enumerate(predict_datasets):
-    #         # Removing the `label` columns because it contains -1 and Trainer won't like that.
-    #         predict_dataset = predict_dataset.remove_columns("label")
-    #         predictions = trainer.predict(predict_dataset, metric_key_prefix="predict").predictions
-    #         predictions = np.squeeze(predictions) if is_regression else np.argmax(predictions, axis=1)
-    #         output_predict_file = training_args.output_dir + "{}_predict.csv".format(datasets_name[idx])
-    #         reader = csv.reader(open(datasets_file[idx]), delimiter=',')
-    #         next(reader)
-    #         titles, abstracts, labels = [], [], []
-    #         for line in reader:
-    #             title, abstract, label = line[0], line[1], line[2]
-    #             titles.append(title)
-    #             abstracts.append(abstract)
-    #             labels.append(label)
-    #         if trainer.is_world_process_zero():
-    #             writer = csv.writer(open(output_predict_file, 'w'), delimiter=',')
-    #             logger.info(f"***** Predict Training results *****")
-    #             writer.writerow(['Title', 'Abstract', 'Topic(Label)', 'Topic(Label)_predict'])
-    #             for idx, item in enumerate(predictions):
-    #                 pred_label = label_list[item]
-    #                 writer.writerow([titles[idx], abstracts[idx], labels[idx], pred_label])
-
+                import pandas as pd
+                df = pd.read_csv(data_args.test_file)
+                df["pred"] = final_predictions
+                df.to_csv(output_predict_file, index=False)
 
     kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "text-classification"}
     if data_args.task_name is not None:
